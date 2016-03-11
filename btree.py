@@ -12,41 +12,64 @@
 import math
 import itertools
 
-def merge_iters(xs, ys, key=lambda x: x):
-    try:
-        next_x = xs.next()
-    except StopIteration:
-        for y in ys:
-            yield y
-        return
 
-    try:
-        next_y = ys.next()
-    except StopIteration:
-        yield next_x
-        for x in xs:
-            yield x
-        return
+class Peeking(object):
+    def __init__(self, iterator):
+        self._iterator = iterator
+        self._has_next = None
 
-    while True:
-        if key(next_x) <= key(next_y):
-            yield next_x
-            try:
-                next_x = xs.next()
-            except StopIteration:
-                yield next_y
-                for y in ys:
-                    yield y
-                return
+    def __iter__(self):
+        if self._has_next != True:
+            return self._iterator
         else:
-            yield next_y
+            return itertools.chain(iter([self._next]), self._iterator)
+
+    def has_next(self):
+        if self._has_next is None:
             try:
-                next_y = xs.next()
+                self._next = self._iterator.next()
+                self._has_next = True
             except StopIteration:
-                yield next_x
-                for x in xs:
-                    yield x
-                return
+                self._has_next = False
+
+        return self._has_next
+
+    def peek(self):
+        if self.has_next():
+            return self._next
+        else:
+            raise StopIteration()
+
+    def next(self):
+        if self._has_next is None:
+            return self._iterator.next()
+        elif self._has_next:
+            self._has_next = None
+            return self._next
+        else:
+            raise StopIteration()
+
+
+# Outputs exactly one item per key:
+#   * Prefers the left argument when there is a key conflict.
+#   * Assumes input iterators are sorted in strictly increasing order
+def merge_iters(xs, ys, key=lambda x: x):
+    xs, ys = Peeking(xs), Peeking(ys)
+    while xs.has_next() and ys.has_next():
+        c = cmp(key(xs.peek()), key(ys.peek()))
+        if c == 0:
+            yield xs.next()
+            ys.next()
+        elif c < 0:
+            yield xs.next()
+        elif c > 0:
+            yield ys.next()
+
+    for x in xs:
+        yield x
+
+    for y in ys:
+        yield y
 
 
 # Internal nodes a triple of (keys, list of singleton lists of child nodes, internal entries)
@@ -176,7 +199,7 @@ class ABTree(object):
         return None
 
 
-t = ABTree(min_outdegree=2, max_leaf_entries=2, max_internal_entries = 0)
+t = ABTree(min_outdegree=2, max_leaf_entries=2, max_internal_entries=0)
 for x in [3,6,2,1,5,5]:
     print list(t)
     print '.. add', x
