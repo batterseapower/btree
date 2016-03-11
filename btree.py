@@ -91,15 +91,15 @@ class ABTree(object):
             raise ValueError('max_leaf_entries must be at least ' + str(self.max_push_down))
 
     def __iter__(self):
-        return self.iter_node(self.root)
+        return self._iter_node(self.root)
 
-    def iter_node(self, node):
+    def _iter_node(self, node):
         if isinstance(node, dict):
             return iter(sorted(node.items(), key=lambda p: p[0]))
         else:
             keys, children, internal = node
 
-            iterators = map(self.iter_node, children)
+            iterators = map(self._iter_node, children)
             return merge_iters(iter(sorted(internal.items(), key=lambda p: p[0])),
                                itertools.chain(*iterators),
                                key=lambda p: p[0])
@@ -122,14 +122,14 @@ class ABTree(object):
 
 
     def __setitem__(self, x, y):
-        overflow = self.add_to(self.root, {x: y})
+        overflow = self._add_to(self.root, {x: y})
         if overflow is not None:
             keys, children = overflow
             self.root = (keys, children, {})
 
     # Invariant: len(adds) <= ceiling((max_internal_entries + 1) / max_outdegree)
     # Returns: None (if it fit), or a node one higher level than the input otherwise. Overflowing node has no internal entries.
-    def add_to(self, node, adds):
+    def _add_to(self, node, adds):
         if isinstance(node, dict):
             node.update(adds)
             if len(node) <= self.max_leaf_entries:
@@ -177,7 +177,7 @@ class ABTree(object):
         for k in child_adds:
             del internal[k]
 
-        overflow = self.add_to(child, child_adds)
+        overflow = self._add_to(child, child_adds)
         if overflow is not None:
             ov_keys, ov_children = overflow
             
