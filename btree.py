@@ -10,6 +10,7 @@
 #num_keys = 1_000_000_000
 
 import math
+import random
 import itertools
 
 
@@ -120,6 +121,37 @@ class ABTree(object):
             else:
                 node = children[-1]
 
+    def check(self):
+        self._check(self.root, None, None)
+
+    def _check_dict(self, node, mn, mx):
+        assert mn is None or ([k for k in node if k <= mn] == []), 'exists %s <= %s' % (node.keys(), mn)
+        assert mx is None or ([k for k in node if k >  mx] == []), 'exists %s > %s' % (node.keys(), mx)
+
+    def _check(self, node, mn, mx):
+        if isinstance(node, dict):
+            assert len(node) <= self.max_leaf_entries
+            self._check_dict(node, mn, mx)
+            return 0
+        else:
+            keys, children, internal = node
+            assert len(keys) + 1 == len(children)
+            assert len(children) <= self.max_outdegree
+            
+            depths = []
+            depths.append(self._check(children[0], mn, keys[0]))
+            for child_mn, child_mx, child in zip(keys, keys[1:], children[1:]):
+                depths.append(self._check(child, child_mn, child_mx))
+            depths.append(self._check(children[-1], keys[-1], mx))
+            
+            depth = depths[0]
+            assert len([d for d in depths if d != depth]) == 0
+
+            assert len(internal) <= self.max_internal_entries
+            self._check_dict(internal, mn, mx)
+
+            return depth + 1
+
 
     def __setitem__(self, x, y):
         overflow = self._add_to(self.root, {x: y})
@@ -191,27 +223,45 @@ class ABTree(object):
                 # n >= min_outdegree * 2
                 # n / 2 >= min_outdegree
                 split_point = n / 2
-                middle = overfull_keys[split_point-1]
-                left = (overfull_keys[:split_point-1], overfull_children[:split_point], {k: v for k, v in internal.iteritems() if k <= middle})
-                right = (overfull_keys[split_point:], overfull_children[split_point:],  {k: v for k, v in internal.iteritems() if k >  middle})
+                middle = keys[split_point-1]
+                left = (keys[:split_point-1], children[:split_point], {k: v for k, v in internal.iteritems() if k <= middle})
+                right = (keys[split_point:], children[split_point:],  {k: v for k, v in internal.iteritems() if k >  middle})
                 return ([middle], [left, right])
         
         return None
 
 
-t = ABTree(min_outdegree=2, max_leaf_entries=2, max_internal_entries=0)
-for x in [3,6,2,1,5,5]:
+if False:
+    t = ABTree(min_outdegree=2, max_leaf_entries=2, max_internal_entries=0)
+else:
+    min_outdegree = random.randrange(2, 10)
+    max_outdegree = min_outdegree * 2 - 1
+    max_internal_entries = random.randrange(0, 10)
+    
+    max_push_down = int(math.ceil((max_internal_entries + 1) / float(max_outdegree)))
+    max_leaf_entries = random.randrange(max_push_down, max_push_down + 10)
+
+    print (min_outdegree, max_leaf_entries, max_internal_entries)
+
+    t = ABTree(min_outdegree, max_leaf_entries, max_internal_entries)
+
+if False:
+    test = [3,6,2,1,5,5]
+else:
+    test = [random.randrange(0, 100) for _ in range(0, 1000)]
+
+if False:
+    for x in test:
+        print list(t)
+        t.check()
+        print '.. add', x
+        t[x] = str(x)
     print list(t)
-    print '.. add', x
-    t[x] = str(x)
-print list(t)
+    t.check()
+else:
+    for x in test:
+        t.check()
+        t[x] = str(x)
+    t.check()
 
-
-
-
-#class DAM(object):
-#   def allocate(self, slots, slot_size_bytes):
-#       bytes = slot_size_bytes / slots
-#       math.ceil(bytes / page_size_bytes)
-
-
+assert {k for k, _ in t} == set(test)
