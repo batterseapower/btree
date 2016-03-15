@@ -1,17 +1,7 @@
-#kb_to_bytes = 1024
-#mb_to_bytes = 1024 * kb_to_bytes
-#gb_to_bytes = 1024 * mb_to_bytes
-
-#key_size_bytes = 100
-#value_size_bytes = 100
-#page_size_bytes = 4 * kb_to_bytes
-
-#memory_bytes = 4 * gb_to_bytes
-#num_keys = 1_000_000_000
-
 import math
 import random
 import itertools
+import sys
 
 
 class Peeking(object):
@@ -73,14 +63,15 @@ def merge_iters(xs, ys, key=lambda x: x):
         yield y
 
 
-# Internal nodes a triple of (keys, list of singleton lists of child nodes, internal entries)
-# Leaf nodes are dictionaries of bounded size
-class ABTree(object):
+# Internal nodes a triple of (keys, list of child nodes, dictionary of internal entries)
+# Leaf nodes are dictionaries
+class BEpsilonTree(object):
     def __init__(self, min_outdegree, max_leaf_entries, max_internal_entries):
         self.max_outdegree = min_outdegree * 2 - 1
         self.max_leaf_entries = max_leaf_entries
         self.max_internal_entries = max_internal_entries
         self.root = {}
+        self.stats = {}
 
         self.max_push_down = int(math.ceil((max_internal_entries + 1) / float(self.max_outdegree)))
 
@@ -90,36 +81,6 @@ class ABTree(object):
             raise ValueError('max_internal_entries must be at least 0')
         if max_leaf_entries < self.max_push_down:
             raise ValueError('max_leaf_entries must be at least ' + str(self.max_push_down))
-
-    def __iter__(self):
-        return self._iter_node(self.root)
-
-    def _iter_node(self, node):
-        if isinstance(node, dict):
-            return iter(sorted(node.items(), key=lambda p: p[0]))
-        else:
-            keys, children, internal = node
-
-            iterators = map(self._iter_node, children)
-            return merge_iters(iter(sorted(internal.items(), key=lambda p: p[0])),
-                               itertools.chain(*iterators),
-                               key=lambda p: p[0])
-
-    def __contains__(self, x):
-        node = self.root
-        while True:
-            if isinstance(node, dict):
-                return x in node
-
-            keys, children, internal = node
-            if x in internal:
-                return True
-            for key, child in zip(keys, children):
-                if x <= key:
-                    node = child
-                    break
-            else:
-                node = children[-1]
 
     def check(self):
         self._check(self.root, None, None)
@@ -152,16 +113,54 @@ class ABTree(object):
 
             return depth + 1
 
+    def __iter__(self):
+        return self._iter_node(self.root)
+
+    def _iter_node(self, node):
+        if isinstance(node, dict):
+            return iter(sorted(node.items(), key=lambda p: p[0]))
+        else:
+            keys, children, internal = node
+
+            iterators = map(self._iter_node, children)
+            return merge_iters(iter(sorted(internal.items(), key=lambda p: p[0])),
+                               itertools.chain(*iterators),
+                               key=lambda p: p[0])
+
+    def __contains__(self, x):
+        level = 0
+        node = self.root
+        while True:
+            reads = self.stats.setdefault('reads', {})
+            reads[level] = reads.get(level, 0) + 1
+
+            if isinstance(node, dict):
+                return x in node
+
+            keys, children, internal = node
+            if x in internal:
+                return True
+            for key, child in zip(keys, children):
+                if x <= key:
+                    node = child
+                    break
+            else:
+                node = children[-1]
+
+            level = level + 1
 
     def __setitem__(self, x, y):
-        overflow = self._add_to(self.root, {x: y})
+        overflow = self._add_to(0, self.root, {x: y})
         if overflow is not None:
             keys, children = overflow
             self.root = (keys, children, {})
 
     # Invariant: len(adds) <= ceiling((max_internal_entries + 1) / max_outdegree)
     # Returns: None (if it fit), or a node one higher level than the input otherwise. Overflowing node has no internal entries.
-    def _add_to(self, node, adds):
+    def _add_to(self, level, node, adds):
+        writes = self.stats.setdefault('writes', {})
+        writes[level] = writes.get(level, 0) + 1
+
         if isinstance(node, dict):
             node.update(adds)
             if len(node) <= self.max_leaf_entries:
@@ -209,7 +208,7 @@ class ABTree(object):
         for k in child_adds:
             del internal[k]
 
-        overflow = self._add_to(child, child_adds)
+        overflow = self._add_to(level + 1, child, child_adds)
         if overflow is not None:
             ov_keys, ov_children = overflow
             
@@ -231,37 +230,93 @@ class ABTree(object):
         return None
 
 
-if False:
-    t = ABTree(min_outdegree=2, max_leaf_entries=2, max_internal_entries=0)
-else:
-    min_outdegree = random.randrange(2, 10)
-    max_outdegree = min_outdegree * 2 - 1
-    max_internal_entries = random.randrange(0, 10)
+kb_to_bytes = 1024
+mb_to_bytes = 1024 * kb_to_bytes
+gb_to_bytes = 1024 * mb_to_bytes
+
+key_size_bytes = 100
+value_size_bytes = 1000
+page_size_bytes = 4 * kb_to_bytes
+
+memory_bytes = 4 * mb_to_bytes
+num_keys = 100000
+
+if True:
+    tree, = sys.argv[1:]
+
+    if tree == 'btree':
+        max_internal_entries = 0
+        max_outdegree = int(math.floor(page_size_bytes / float(key_size_bytes)))
+    elif tree == 'brt':
+        max_internal_entries = int(math.floor((page_size_bytes - 2 * key_size_bytes) / float(key_size_bytes + value_size_bytes)))
+        max_outdegree = 3
+    elif tree == 'fractal':
+        max_internal_entries = int(math.ceiling(math.sqrt(page_size_bytes / float(key_size_bytes + value_size_bytes))))
+        max_outdegree = 1 + int(math.floor((page_size_bytes - (max_internal_entries * (key_size_bytes + value_size_bytes))) / float(key_size_bytes)))
+    else:
+        raise ValueError('Bad tree type ' + tree)
+
+    min_outdegree = int(math.floor((max_outdegree + 1) / 2))
+    max_leaf_entries = int(math.floor(page_size_bytes / float(key_size_bytes + value_size_bytes)))
+    t = BEpsilonTree(min_outdegree, max_leaf_entries, max_internal_entries)
+
+    print {
+        'max_internal_entries': max_internal_entries,
+        'min_outdegree': min_outdegree,
+        'max_outdegree': max_outdegree,
+        'max_leaf_entries': max_leaf_entries,
+        # Tree of height h has
+        #   max_outdegree^(h - 1) nodes in the last level
+        #   max_outdegree^h - 1 nodes overall
+        'memory_levels': math.log((memory_bytes / float(page_size_bytes)) + 1, max_outdegree),
+        'levels':        1 + math.log(num_keys / max_leaf_entries, max_outdegree),
+    }
+
+    test = [random.randrange(0, 1000 * num_keys) for _ in range(0, num_keys)]
     
-    max_push_down = int(math.ceil((max_internal_entries + 1) / float(max_outdegree)))
-    max_leaf_entries = random.randrange(max_push_down, max_push_down + 10)
-
-    print (min_outdegree, max_leaf_entries, max_internal_entries)
-
-    t = ABTree(min_outdegree, max_leaf_entries, max_internal_entries)
-
-if False:
-    test = [3,6,2,1,5,5]
-else:
-    test = [random.randrange(0, 100) for _ in range(0, 1000)]
-
-if False:
     for x in test:
+        t[x] = ()
+    
+    for x in test:
+        x in t
+    
+    print t.stats
+else:
+    if False:
+        t = BEpsilonTree(min_outdegree=2, max_leaf_entries=2, max_internal_entries=0)
+    else:
+        min_outdegree = random.randrange(2, 10)
+        max_outdegree = min_outdegree * 2 - 1
+        max_internal_entries = random.randrange(0, 10)
+        
+        max_push_down = int(math.ceil((max_internal_entries + 1) / float(max_outdegree)))
+        max_leaf_entries = random.randrange(max_push_down, max_push_down + 10)
+
+        print (min_outdegree, max_leaf_entries, max_internal_entries)
+
+        t = BEpsilonTree(min_outdegree, max_leaf_entries, max_internal_entries)
+
+    if False:
+        test = [3,6,2,1,5,5]
+    else:
+        test = [random.randrange(0, 100) for _ in range(0, 1000)]
+
+    if False:
+        for x in test:
+            print list(t)
+            t.check()
+            print '.. add', x
+            t[x] = str(x)
         print list(t)
         t.check()
-        print '.. add', x
-        t[x] = str(x)
-    print list(t)
-    t.check()
-else:
-    for x in test:
+    else:
+        for x in test:
+            t.check()
+            t[x] = str(x)
         t.check()
-        t[x] = str(x)
-    t.check()
 
-assert {k for k, _ in t} == set(test)
+    for x in test:
+        x in t
+
+    assert {k for k, _ in t} == set(test)
+    print t.stats
