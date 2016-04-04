@@ -4,6 +4,7 @@ import itertools
 import sys
 import bisect
 import percache
+import os
 import pandas as pd
 import numpy as np
 import collections
@@ -23,7 +24,15 @@ else:
     key_size_bytes = 16
     value_size_bytes = 240
 
-page_size_bytes = 4 * kb_to_bytes
+# Fractal trees don't really work with small pages because ideally
+# you need to be pushing > 1 item down to the leaves in the event you
+# actually need to write down that far. If your branching factor >=
+# number of internal items then you only push down 1 and sadness results.
+if False:
+    page_size_bytes = 4 * kb_to_bytes
+else:
+    value_dir += '_large-pages'
+    page_size_bytes = 32 * kb_to_bytes
 
 #memory_bytes = 4 * mb_to_bytes
 memory_bytes = 1 * mb_to_bytes
@@ -31,6 +40,8 @@ memory_bytes = 1 * mb_to_bytes
 
 memory_pages = int(math.floor(memory_bytes / page_size_bytes))
 
+if not os.path.isdir(value_dir):
+    os.mkdirs(value_dir)
 cache = percache.Cache(value_dir + "/btree-cache-" + str(memory_bytes), livesync=True)
 
 
@@ -158,16 +169,11 @@ else:
 # Internal nodes a triple of (keys, list of child nodes, dictionary of internal entries)
 # Leaf nodes are dictionaries
 class InternalNode(object):
-    __slots__ = ['keys', 'children', 'internal', 'node_count']
+    __slots__ = ['keys', 'children', 'internal']
     def __init__(self, keys, children, internal):
         self.keys = keys
         self.children = children
         self.internal = internal
-        self.refresh_node_count()
-
-    # Does not include itself in the count
-    def refresh_node_count(self):
-        self.node_count = sum([1 if isinstance(child, SortedDict) else 1 + child.node_count for child in self.children])
 
 class BEpsilonTree(object):
     def __init__(self, min_outdegree, max_leaf_entries, max_internal_entries):
@@ -175,6 +181,7 @@ class BEpsilonTree(object):
         self.max_leaf_entries = max_leaf_entries
         self.max_internal_entries = max_internal_entries
         self.root = SortedDict()
+        self.node_counts = [1]
         self.stats = {}
 
         self.max_push_down = int(math.ceil((max_internal_entries + 1) / float(self.max_outdegree)))
@@ -187,47 +194,41 @@ class BEpsilonTree(object):
             raise ValueError('max_leaf_entries must be at least ' + str(self.max_push_down))
 
     def check(self):
-        self._check(self.root, None, None)
+        assert self.node_counts == [1] + self._check(self.root, None, None)
 
     def _check_dict(self, node, mn, mx):
         assert mn is None or ([k for k in node if k <= mn] == []), 'exists %s <= %s' % (node.keys(), mn)
         assert mx is None or ([k for k in node if k >  mx] == []), 'exists %s > %s' % (node.keys(), mx)
 
-    # Returns (number of levels to leaves, number of nodes contained -- including node itself)
+    # Returns a list containing one item per level below the node, each item in the list
+    # being the number of nodes at that level
     def _check(self, node, mn, mx):
         if isinstance(node, SortedDict):
             assert len(node) <= self.max_leaf_entries
             self._check_dict(node, mn, mx)
-            return (0, 1)
+            return []
         else:
-            keys, children, internal, node_count = node.keys, node.children, node.internal, node.node_count
+            keys, children, internal = node.keys, node.children, node.internal
             assert len(keys) + 1 == len(children)
             assert len(children) <= self.max_outdegree
             
-            depths, total_count = [], 0
-            
-            depth, count = self._check(children[0], mn, keys[0])
-            depths.append(depth)
-            total_count += count
+            total_counts = self._check(children[0], mn, keys[0])
             
             for child_mn, child_mx, child in zip(keys, keys[1:], children[1:]):
-                depth, count = self._check(child, child_mn, child_mx)
-                depths.append(depth)
-                total_count += count
+                counts = self._check(child, child_mn, child_mx)
+                assert len(counts) == len(total_counts)
+                for i in xrange(0, len(total_counts)):
+                    total_counts[i] += counts[i]
             
-            depth, count = self._check(children[-1], keys[-1], mx)
-            depths.append(depth)
-            total_count += count
-            
-            depth = depths[0]
-            assert len([d for d in depths if d != depth]) == 0
+            counts = self._check(children[-1], keys[-1], mx)
+            assert len(counts) == len(total_counts)
+            for i in xrange(0, len(total_counts)):
+                total_counts[i] += counts[i]
 
             assert len(internal) <= self.max_internal_entries
             self._check_dict(internal, mn, mx)
 
-            assert node_count == total_count, '{} != {}'.format(node_count, total_count)
-
-            return (depth + 1, total_count + 1)
+            return [len(children)] + total_counts
 
     def __iter__(self):
         return self._iter_node(self.root)
@@ -248,7 +249,7 @@ class BEpsilonTree(object):
         while True:
             self.stats.setdefault('reads', collections.Counter())[level] += 1
 
-            remaining_memory_pages, is_cached = self.test_is_cached(remaining_memory_pages, node)
+            remaining_memory_pages, is_cached = self.test_is_cached(remaining_memory_pages, level)
             if not is_cached:
                 self.stats.setdefault('uncached_reads', collections.Counter())[level] += 1
 
@@ -257,20 +258,36 @@ class BEpsilonTree(object):
 
             if x in node.internal:
                 return True
-            
+
             node = node.children[bisect.bisect(node.keys, x)]
             level = level + 1
 
+    def test_is_cached(self, remaining_memory_pages, level):
+        if remaining_memory_pages <= 0:
+            return (remaining_memory_pages, False)
+        
+        n = self.node_counts[level]
+        if n <= remaining_memory_pages:
+            return (remaining_memory_pages - n, True)
+
+        is_cached = random.randint(0, n - 1) < remaining_memory_pages
+        return (0, is_cached)
+
     def __setitem__(self, x, y):
-        overflow = self._add_to(0, self.root, {x: y})
+        overflow = self._add_to(0, memory_pages, self.root, {x: y})
         if overflow is not None:
             keys, children = overflow
             self.root = InternalNode(keys, children, SortedDict())
+            self.node_counts = [1] + self.node_counts
 
     # Invariant: len(adds) <= ceiling((max_internal_entries + 1) / max_outdegree)
     # Returns: None (if it fit), or a node one higher level than the input otherwise. Overflowing node has no internal entries.
-    def _add_to(self, level, node, adds):
+    def _add_to(self, level, remaining_memory_pages, node, adds):
         self.stats.setdefault('writes', collections.Counter())[level] += 1
+
+        remaining_memory_pages, is_cached = self.test_is_cached(remaining_memory_pages, level)
+        if not is_cached:
+            self.stats.setdefault('uncached_writes', collections.Counter())[level] += 1
 
         if isinstance(node, SortedDict):
             node.update(adds)
@@ -286,6 +303,7 @@ class BEpsilonTree(object):
                 items = node.items()
                 split_point = len(items)/2
                 left, right = items[:split_point], items[split_point:]
+                self.node_counts[level] += 1 # We split the 1 node at this level into 2 (left and right)
                 return ([left[-1][0]], [SortedDict(left), SortedDict(right)])
 
         keys, children, internal = node.keys, node.children, node.internal
@@ -327,7 +345,7 @@ class BEpsilonTree(object):
         for k in child_adds:
             del internal[k]
 
-        overflow = self._add_to(level + 1, child, child_adds)
+        overflow = self._add_to(level + 1, remaining_memory_pages, child, child_adds)
         if overflow is not None:
             ov_keys, ov_children = overflow
             
@@ -352,9 +370,9 @@ class BEpsilonTree(object):
 
                 left = InternalNode(keys[:split_point-1], children[:split_point], SortedDict(internal_left))
                 right = InternalNode(keys[split_point:], children[split_point:],  SortedDict(internal_right))
+                self.node_counts[level] += 1 # We split the 1 node at this level into 2 (left and right)
                 return ([middle], [left, right])
         
-        node.refresh_node_count() # We or a child might have mutated children
         return None
 
     def __str__(self):
@@ -472,20 +490,20 @@ def experiment_uncached(tree, num_keys):
     
     return {
         'params': params,
-        'uncached_reads': summarise(t.stats['reads']),
-        'uncached_writes': summarise(t.stats['writes'])
+        'stats': t.stats
     }
 
-if True:
-    experiment_uncached('btree',   300)
-    experiment_uncached('fractal', 300)
+if False:
+    print experiment_uncached('btree',   300000)
+    print experiment_uncached('fractal', 300000)
 elif False:
     tree, = sys.argv[1:]
 
     rows = {}
-    for num_keys in [x * int(math.pow(10, e)) for e in range(6) for x in (1, 3, 7)]:
-        res = experiment(tree, num_keys)
-        rows[num_keys] = res
+    for num_keys in [x * int(math.pow(10, e)) for e in range(5) for x in (1, 3, 7)]:
+        stats = experiment(tree, num_keys)['stats']
+        stat_values = {stat: sum(counts.values()) for stat, counts in stats.iteritems()}
+        rows[num_keys] = stat_values
         
     df = pd.DataFrame.from_dict(rows)
     df.T.plot(logx=True, logy=True)
@@ -500,10 +518,12 @@ elif True:
     for tree in ('btree', 'brt', 'fractal'):
         row = rows[tree] = {}
         for num_keys in num_keyss:
-            res = experiment(tree, num_keys)
-            row[num_keys] = res[stat]
+            stats = experiment(tree, num_keys)['stats']
+            stat_value = sum(stats.get(stat, {}).values())
+            row[num_keys] = stat_value
 
     df = pd.DataFrame.from_dict(rows)
+    print df
     ax = df.plot(logx=True, logy=True)
 
     memory_to_data = [
