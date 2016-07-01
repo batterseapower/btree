@@ -512,7 +512,7 @@ elif False:
 elif True:
     stat, = sys.argv[1:] # e.g. 'uncached_reads'
 
-    num_keyss = [x * int(math.pow(10, e)) for e in range(6) for x in (1, 3, 7)]
+    num_keyss = [x * int(math.pow(10, e)) for e in range(7) for x in (1, 3, 7)]
 
     rows = {}
     for tree in ('btree', 'brt', 'fractal'):
